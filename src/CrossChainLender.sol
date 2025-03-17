@@ -1,17 +1,46 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.25;
 
-import {LendingInstructions} from "./interfaces/ICrossChainLender.sol";
+import {BaseLendingInstructions, LendingAction} from "./interfaces/ICrossChainLender.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
-import {IComptroller, IQiToken, IPriceOracle} from "./interfaces/IBenqi.sol";
 import {IERC20SendAndCallReceiver} from "@ictt/interfaces/IERC20SendAndCallReceiver.sol";
+import {INativeSendAndCallReceiver} from "@ictt/interfaces/INativeSendAndCallReceiver.sol";
 import {IERC20TokenTransferrer, SendTokensInput} from "@ictt/interfaces/IERC20TokenTransferrer.sol";
+import {INativeTokenTransferrer} from "@ictt/interfaces/INativeTokenTransferrer.sol";
+import {IWrappedNativeToken} from "@ictt/interfaces/IWrappedNativeToken.sol";
+import {PositionHolder} from "./PositionHolder.sol";
+import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-contract CrossChainLender is IERC20SendAndCallReceiver {
-    IComptroller public immutable comptroller;
+abstract contract CrossChainLender is IERC20SendAndCallReceiver, INativeSendAndCallReceiver, Ownable {
+    using Address for address payable;
 
-    constructor(address _comptroller) {
-        comptroller = IComptroller(_comptroller);
+    mapping(address => address) public positionHolders;
+    mapping(address => bool) public allowlistedCallers;
+    address public immutable WRAPPED_NATIVE;
+
+    event CallerAllowlisted(address indexed caller);
+    event CallerRemoved(address indexed caller);
+
+    modifier onlyAllowlisted() {
+        require(allowlistedCallers[msg.sender], "Caller not allowlisted");
+        _;
+    }
+
+    constructor(address wrappedNative) Ownable(msg.sender) {
+        WRAPPED_NATIVE = wrappedNative;
+    }
+
+    receive() external payable {}
+
+    function allowlistCaller(address caller) external onlyOwner {
+        allowlistedCallers[caller] = true;
+        emit CallerAllowlisted(caller);
+    }
+
+    function removeCaller(address caller) external onlyOwner {
+        allowlistedCallers[caller] = false;
+        emit CallerRemoved(caller);
     }
 
     function receiveTokens(
@@ -21,17 +50,69 @@ contract CrossChainLender is IERC20SendAndCallReceiver {
         address token,
         uint256 amount,
         bytes calldata payload
-    ) external override {
-        IERC20(token).transferFrom(msg.sender, address(this), amount);
-        LendingInstructions memory lendingInstructions = abi.decode(payload, (LendingInstructions));
-        (uint256 collateralQiTokensMinted, address borrowedToken, uint256 borrowedAmount) = supplyCollateralAndBorrow(
-            token, lendingInstructions.collateralQiToken, amount, lendingInstructions.borrowQiToken
-        );
-        IERC20(lendingInstructions.collateralQiToken).transfer(originSenderAddress, collateralQiTokensMinted);
-        IERC20(borrowedToken).approve(lendingInstructions.sourceTokenTransferrerAddress, borrowedAmount);
+    ) external override onlyAllowlisted {
+        address positionHolder = _getOrCreatePositionHolder(originSenderAddress);
+        IERC20(token).transferFrom(msg.sender, positionHolder, amount);
+
+        _receive(originSenderAddress, positionHolder, token, amount, payload, 0);
+    }
+
+    function receiveTokens(bytes32, address, address originSenderAddress, bytes calldata payload)
+        external
+        payable
+        override
+        onlyAllowlisted
+    {
+        address positionHolder = _getOrCreatePositionHolder(originSenderAddress);
+        payable(positionHolder).sendValue(msg.value);
+        _receive(originSenderAddress, positionHolder, WRAPPED_NATIVE, msg.value, payload, msg.value);
+    }
+
+    function _receive(
+        address originSenderAddress,
+        address positionHolder,
+        address token,
+        uint256 amount,
+        bytes calldata payload,
+        uint256 nativeValue
+    ) internal {
+        BaseLendingInstructions memory instructions = abi.decode(payload, (BaseLendingInstructions));
+
+        address tokenOut;
+        uint256 amountOut;
+
+        if (instructions.action == LendingAction.Borrow) {
+            _supplyCollateral(positionHolder, token, amount, instructions.protocolData, nativeValue);
+
+            (, uint256 safeMaxBorrow) =
+                _calculateMaxBorrow(positionHolder, instructions.protocolData, instructions.riskFactor);
+            (tokenOut, amountOut) = _borrow(positionHolder, instructions.protocolData, safeMaxBorrow);
+        } else if (instructions.action == LendingAction.Repay) {
+            _repay(positionHolder, token, amount, instructions.protocolData, nativeValue);
+            (tokenOut, amountOut) = _withdraw(positionHolder, instructions.protocolData);
+        }
+
+        uint256 remainingTokenBalance = IERC20(token).balanceOf(positionHolder);
+        if (remainingTokenBalance > 0) {
+            bytes memory encodedCalldata =
+                abi.encodeWithSelector(IERC20.transfer.selector, originSenderAddress, remainingTokenBalance);
+            PositionHolder(payable(positionHolder)).manage(token, encodedCalldata, 0);
+        }
+
+        if (amountOut > 0) {
+            _sendTokens(originSenderAddress, tokenOut, amountOut, instructions);
+        }
+    }
+
+    function _sendTokens(
+        address originSenderAddress,
+        address token,
+        uint256 amount,
+        BaseLendingInstructions memory instructions
+    ) internal {
         SendTokensInput memory sendTokensInput = SendTokensInput({
-            destinationBlockchainID: lendingInstructions.destinationBlockchainID,
-            destinationTokenTransferrerAddress: lendingInstructions.destinationTokenTransferrerAddress,
+            destinationBlockchainID: instructions.destinationBlockchainID,
+            destinationTokenTransferrerAddress: instructions.destinationTokenTransferrerAddress,
             recipient: originSenderAddress,
             primaryFeeTokenAddress: address(0),
             primaryFee: 0,
@@ -39,61 +120,57 @@ contract CrossChainLender is IERC20SendAndCallReceiver {
             requiredGasLimit: 350_000,
             multiHopFallback: address(0)
         });
-        IERC20TokenTransferrer(lendingInstructions.sourceTokenTransferrerAddress).send(sendTokensInput, borrowedAmount);
+
+        if (token == WRAPPED_NATIVE) {
+            IWrappedNativeToken(WRAPPED_NATIVE).withdraw(amount);
+            INativeTokenTransferrer(instructions.sourceTokenTransferrerAddress).send{value: amount}(sendTokensInput);
+        } else {
+            IERC20(token).approve(instructions.sourceTokenTransferrerAddress, amount);
+            IERC20TokenTransferrer(instructions.sourceTokenTransferrerAddress).send(sendTokensInput, amount);
+        }
     }
 
-    function supplyCollateralAndBorrow(
-        address tokenReceived,
-        address collateralQiToken,
+    function _getOrCreatePositionHolder(address originSenderAddress) internal returns (address) {
+        address positionHolder = positionHolders[originSenderAddress];
+
+        if (positionHolder == address(0)) {
+            PositionHolder newPositionHolder = new PositionHolder(originSenderAddress);
+            positionHolder = address(newPositionHolder);
+            positionHolders[originSenderAddress] = positionHolder;
+        }
+
+        return positionHolder;
+    }
+
+    function _supplyCollateral(
+        address positionHolder,
+        address collateralToken,
         uint256 collateralAmount,
-        address borrowQiToken
-    ) internal returns (uint256 collateralQiTokensMinted, address borrowedToken, uint256 borrowedAmount) {
-        address underlyingCollateral = IQiToken(collateralQiToken).underlying();
-        require(tokenReceived == underlyingCollateral, "Token mismatch");
+        bytes memory protocolData,
+        uint256 nativeValue
+    ) internal virtual;
 
-        IERC20(underlyingCollateral).approve(collateralQiToken, collateralAmount);
-
-        uint256 balanceBefore = IERC20(collateralQiToken).balanceOf(address(this));
-        require(IQiToken(collateralQiToken).mint(collateralAmount) == 0, "Mint failed");
-        collateralQiTokensMinted = IERC20(collateralQiToken).balanceOf(address(this)) - balanceBefore;
-
-        address[] memory markets = new address[](1);
-        markets[0] = collateralQiToken;
-        uint256[] memory results = comptroller.enterMarkets(markets);
-        require(results[0] == 0, "Enter market failed");
-
-        (, uint256 safeMaxBorrow) = calculateMaxBorrow(collateralQiToken);
-
-        borrowedToken = IQiToken(borrowQiToken).underlying();
-        balanceBefore = IERC20(borrowedToken).balanceOf(address(this));
-        require(IQiToken(borrowQiToken).borrow(safeMaxBorrow) == 0, "Borrow failed");
-        borrowedAmount = IERC20(borrowedToken).balanceOf(address(this)) - balanceBefore;
-    }
-
-    function calculateMaxBorrow(address borrowQiToken)
+    function _calculateMaxBorrow(address positionHolder, bytes memory protocolData, uint8 riskFactor)
         internal
         view
-        returns (uint256 maxBorrow, uint256 safeMaxBorrow)
-    {
-        (uint256 err, uint256 liquidity, uint256 shortfall) =
-            comptroller.getHypotheticalAccountLiquidity(address(this), borrowQiToken, 0, 0);
-        require(err == 0, "Error calculating liquidity");
-        require(liquidity > 0, "No liquidity available");
+        virtual
+        returns (uint256 maxBorrow, uint256 safeMaxBorrow);
 
-        uint256 borrowPrice = comptroller.oracle().getUnderlyingPrice(borrowQiToken);
-        require(borrowPrice > 0, "Invalid borrow price");
+    function _borrow(address positionHolder, bytes memory protocolData, uint256 borrowAmount)
+        internal
+        virtual
+        returns (address borrowedToken, uint256 borrowedAmount);
 
-        uint8 borrowDecimals = IERC20(IQiToken(borrowQiToken).underlying()).decimals();
+    function _repay(
+        address positionHolder,
+        address repayToken,
+        uint256 repayAmount,
+        bytes memory protocolData,
+        uint256 nativeValue
+    ) internal virtual;
 
-        // liquidity is in 1e18
-        // price is in 1e12
-        // Output should be in borrowDecimals (e.g. 1e6 for USDC)
-        maxBorrow = (liquidity * (10 ** borrowDecimals)) / (borrowPrice * 1e18);
-
-        (err,, shortfall) = comptroller.getHypotheticalAccountLiquidity(address(this), borrowQiToken, 0, maxBorrow);
-        require(err == 0, "Error calculating with borrow");
-        require(shortfall == 0, "Borrow would cause shortfall");
-
-        safeMaxBorrow = (maxBorrow * 50) / 100;
-    }
+    function _withdraw(address positionHolder, bytes memory protocolData)
+        internal
+        virtual
+        returns (address withdrawnToken, uint256 withdrawnAmount);
 }

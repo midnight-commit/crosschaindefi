@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.25;
 
-struct LendingInstructions {
-    address collateralQiToken;
-    address borrowQiToken;
+enum LendingAction {
+    Borrow,
+    Repay
+}
+
+struct BaseLendingInstructions {
     address sourceTokenTransferrerAddress;
-    bytes32 destinationBlockchainID;
     address destinationTokenTransferrerAddress;
+    bytes32 destinationBlockchainID;
+    uint8 riskFactor;
+    bytes protocolData;
+    LendingAction action;
+}
+
+interface ICrossChainLender {
+    function positionHolders(address) external view returns (address);
 }
